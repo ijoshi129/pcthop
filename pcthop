@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# pcthop — fuzzy-pick a Proxmox LXC/VM or a plain SSH host and hop into it.
+#
+# Lists guests live from your Proxmox node(s) plus any plain SSH hosts you
+# configure — one fzf picker, with previews — and drops you in: `pct enter`
+# (LXC), `qm terminal` (VM), or `ssh` (host). No agents, no API tokens.
+#
+# https://github.com/ijoshi129/pcthop
+set -euo pipefail
+
+VERSION="0.4.2"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/pcthop/hosts"
+HIST_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/history"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
+
+usage() {
+  cat <<'EOF'
+pcthop — fuzzy-pick a Proxmox LXC/VM or SSH host and hop into it
+
+USAGE
+  pcthop [options] [node ...]
+
+  node          One or more Proxmox nodes (SSH host aliases or user@host).
+                If omitted, uses $PCTHOP_HOSTS (space-separated), then the
+                [nodes] section of ~/.config/pcthop/hosts.
+
+CONFIG (~/.config/pcthop/hosts)
+  [nodes]       Proxmox nodes — guests discovered live (pct/qm list).
+  [ssh]         Plain SSH hosts (aliases from your ~/.ssh/config).
+  Lines before any section header count as [nodes] (old format still works).
+  Env additions: $PCTHOP_HOSTS (nodes), $PCTHOP_SSH_HOSTS.
+
+OPTIONS
+  -c            Containers only
+  -m            VMs only
+  -s            SSH hosts only
+  -l, --loop    Gateway mode: return to the picker when a session ends
+  -L, --list    Print the list and exit (no picker)
+  --no-probe    Skip the reachability probe of SSH hosts (no ●/○ for them)
+  -h, --help    Show this help
+  --version     Print version
+
+KEYS (inside the picker)
+  type to filter · enter to hop in · esc to quit
+
+FILES
+  ~/.cache/pcthop/history   pick history — most-used entries float to the
+                            top of the list (delete the file to reset)
+
+NOTES
+  * Containers open with `pct enter` — works with no sshd/network inside.
+  * VMs open with `qm terminal` — needs a serial console on the VM
+    (`qm set <vmid> -serial0 socket` + a getty inside). Exit with Ctrl+O.
+  * A stopped guest prompts to start it first.
+  * SSH hosts open with plain `ssh <alias>`; ●/○ shows live reachability.
+
+REQUIRES  fzf, ssh (root or pct/qm-capable user on the node)
+EOF
+}
+
+die() { printf 'pcthop: %s\n' "$*" >&2; exit 1; }
+
+# ---------- preview (fzf calls: pcthop __preview {host} {type} {vmid}) -----
+if [[ "${1:-}" == "__preview" ]]; then
+  shift
+  host="${1:-}" type="${2:-}" vmid="${3:-}"
+  if [[ "$type" == "SSH" ]]; then
+    ssh -G "$host" 2>/dev/null \
+      | grep -Ei '^(hostname|user|port|identityfile|proxyjump|connecttimeout) ' \
+      || printf '(no ssh config resolved for %s)\n' "$host"
+    exit 0
+  fi
+  cmd="pct"; [[ "$type" == "VM" ]] && cmd="qm"
+  ssh "${SSH_OPTS[@]}" "$host" "$cmd config $vmid" 2>/dev/null \
+    | grep -v '^description:' \
+    || printf '(no preview — ssh to %s failed)\n' "$host"
+  exit 0
+fi
+
+# ---------- args -----------------------------------------------------------
+want_ct=1 want_vm=1 want_ssh=1 loop=0 list_only=0 probe=1 only_flags=0
+arg_hosts=()
+while (($#)); do
+  case "$1" in
+    -c) want_vm=0; want_ssh=0; ((++only_flags)) ;;
+    -m) want_ct=0; want_ssh=0; ((++only_flags)) ;;
+    -s) want_ct=0; want_vm=0;  ((++only_flags)) ;;
+    -l|--loop) loop=1 ;;
+    -L|--list) list_only=1 ;;
+    --no-probe) probe=0 ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "pcthop $VERSION"; exit 0 ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) arg_hosts+=("$1") ;;
+  esac
+  shift
+done
+((only_flags <= 1)) || die "-c, -m and -s are mutually exclusive"
+
+# ---------- hosts ----------------------------------------------------------
+nodes=() ssh_hosts=()
+
+if ((${#arg_hosts[@]})); then
+  nodes=("${arg_hosts[@]}")
+elif [[ -n "${PCTHOP_HOSTS:-}" ]]; then
+  read -ra nodes <<<"$PCTHOP_HOSTS"
+fi
+
+if [[ -r "$CONFIG_FILE" ]]; then
+  section="nodes"
+  while IFS= read -r line; do
+    line="${line%%#*}"; line="${line//[[:space:]]/}"
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      '[nodes]') section="nodes"; continue ;;
+      '[ssh]')   section="ssh";   continue ;;
+      \[*\])     die "unknown section $line in $CONFIG_FILE" ;;
+    esac
+    if [[ "$section" == "nodes" ]]; then
+      ((${#arg_hosts[@]})) || [[ -n "${PCTHOP_HOSTS:-}" ]] || nodes+=("$line")
+    else
+      ssh_hosts+=("$line")
+    fi
+  done <"$CONFIG_FILE"
+fi
+
+if [[ -n "${PCTHOP_SSH_HOSTS:-}" ]]; then
+  read -ra _x <<<"$PCTHOP_SSH_HOSTS"; ssh_hosts+=("${_x[@]}")
+fi
+
+((${#nodes[@]} + ${#ssh_hosts[@]})) \
+  || { usage >&2; echo >&2; die "nothing to list (args, env, or $CONFIG_FILE)"; }
+
+command -v fzf >/dev/null || ((list_only)) \
+  || die "fzf not found — install it first (brew install fzf / apt install fzf)"
+
+# ---------- gather (all fetches + probes run in parallel) -------------------
+# Row format: host \t TYPE \t vmid \t name \t status
+#   SSH   <alias>          status up/down/-
+#   CT/VM <vmid> <name>    status running/stopped/...
+gather() {
+  rows=""
+  local host tmp
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/pcthop.XXXXXX")
+
+  if ((want_ssh && ${#ssh_hosts[@]})); then
+    for host in "${ssh_hosts[@]}"; do
+      if ((probe)); then
+        {
+          probe_out=$(ssh -o BatchMode=yes -o ConnectTimeout=2 "$host" exit 2>&1) \
+            && echo up > "$tmp/ssh.$host" \
+            || { printf '%s' "$probe_out" \
+                   | grep -qiE 'permission denied|too many authentication|verification failed' \
+                   && echo up > "$tmp/ssh.$host" || echo down > "$tmp/ssh.$host"; }
+        } &
+      else
+        echo '-' > "$tmp/ssh.$host"
+      fi
+    done
+  fi
+  if ((want_ct || want_vm)); then
+    for host in ${nodes[@]+"${nodes[@]}"}; do
+      ssh "${SSH_OPTS[@]}" "$host" \
+          '(pct list 2>/dev/null; echo __QM__; qm list 2>/dev/null)' \
+          > "$tmp/pve.$host" 2>/dev/null || touch "$tmp/pve.$host.err" &
+    done
+  fi
+  wait
+
+  if ((want_ssh && ${#ssh_hosts[@]})); then
+    for host in "${ssh_hosts[@]}"; do
+      rows+="$host"$'\tSSH\t-\t'"$host"$'\t'"$(cat "$tmp/ssh.$host" 2>/dev/null || echo -)"$'\n'
+    done
+  fi
+
+  local guest_rows=""
+  if ((want_ct || want_vm)); then
+    for host in ${nodes[@]+"${nodes[@]}"}; do
+      [[ -e "$tmp/pve.$host.err" ]] \
+        && { printf 'pcthop: warning: cannot reach %s, skipping\n' "$host" >&2; continue; }
+      guest_rows+=$(awk -v host="$host" -v ct="$want_ct" -v vm="$want_vm" '
+        /^__QM__$/          { in_qm = 1; next }
+        /^ *VMID/           { next }                       # header lines
+        NF == 0             { next }
+        !in_qm && ct        { print host "\t" "CT" "\t" $1 "\t" $NF "\t" $2 }
+        in_qm  && vm        { print host "\t" "VM" "\t" $1 "\t" $2  "\t" $3 }
+      ' <"$tmp/pve.$host")$'\n'
+    done
+    rows+=$(printf '%s' "$guest_rows" | sort -t$'\t' -k2,2 -k3,3n)$'\n'
+  fi
+
+  rm -rf "$tmp"
+  rows=$(printf '%s' "$rows" | grep -v '^$' || true)
+  [[ -n "$rows" ]] || die "nothing found on: ${nodes[*]-} ${ssh_hosts[*]-}"
+}
+
+# ---------- frecency --------------------------------------------------------
+# Most-picked entries (from HIST_FILE, key TYPE/host/name) float to the top;
+# ties keep the gather order.
+reorder() {
+  [[ -s "$HIST_FILE" ]] || { cat; return; }
+  awk -F'\t' -v histfile="$HIST_FILE" '
+    BEGIN { while ((getline line < histfile) > 0) cnt[line]++ }
+    { print cnt[$2 "/" $1 "/" $4]+0 "\t" NR "\t" $0 }
+  ' | sort -t$'\t' -k1,1nr -k2,2n | cut -f3-
+}
+
+record_pick() { # record_pick TYPE host name
+  mkdir -p "$(dirname "$HIST_FILE")"
+  printf '%s/%s/%s\n' "$1" "$2" "$3" >> "$HIST_FILE"
+  if [[ $(wc -l < "$HIST_FILE") -gt 500 ]]; then
+    tail -n 250 "$HIST_FILE" > "$HIST_FILE.tmp" && mv "$HIST_FILE.tmp" "$HIST_FILE"
+  fi
+}
+
+# ---------- hop ------------------------------------------------------------
+# In loop mode run the session in the foreground and come back; otherwise
+# exec (replace pcthop with the session).
+run() { if ((loop)); then "$@" || true; else exec "$@"; fi; }
+
+hop() {
+  local host type vmid name status cmd ans
+  read -r host type vmid name status <<<"$1"
+  record_pick "$type" "$host" "$name"
+  if [[ "$type" == "SSH" ]]; then
+    run ssh "$host"
+    return 0
+  fi
+  cmd="pct"; [[ "$type" == "VM" ]] && cmd="qm"
+  if [[ "$status" != "running" ]]; then
+    printf '%s %s (%s) is %s. Start it? [Y/n] ' "$type" "$vmid" "$name" "$status"
+    read -r ans
+    [[ "$ans" =~ ^[Nn] ]] && return 0
+    ssh "${SSH_OPTS[@]}" "$host" "$cmd start $vmid"
+  fi
+  if [[ "$type" == "CT" ]]; then
+    run ssh -t "$host" "pct enter $vmid"
+  else
+    printf 'Attaching serial console to VM %s (%s) — exit with Ctrl+O\n' "$vmid" "$name"
+    run ssh -t "$host" "qm terminal $vmid"
+  fi
+}
+
+# ---------- display --------------------------------------------------------
+# Pretty, narrow-friendly lines: "name  badge [vmid node] glyph". The raw
+# fields ride along behind a \x1f delimiter; fzf shows/matches field 1 only.
+prettify() {
+  awk -F'\t' '
+  { h[NR]=$1; t[NR]=$2; v[NR]=$3; n[NR]=$4; s[NR]=$5
+    if (length($4) > w) w = length($4)
+    if (t[NR] != "SSH") pnodes[$1] = 1 }
+  END {
+    pmulti = 0; for (x in pnodes) pmulti++
+    for (i = 1; i <= NR; i++) {
+      up   = "\033[32m●\033[0m"
+      down = "\033[31m○\033[0m"
+      pretty = sprintf("%-" w "s", n[i])
+      if (t[i] == "SSH") {
+        pretty = pretty "  \033[36mhost\033[0m "
+        if (s[i] == "up") pretty = pretty " " up
+        else if (s[i] == "down") pretty = pretty " " down
+      } else {
+        badge = (t[i] == "CT") ? "\033[33mlxc\033[0m " : "\033[35mvm\033[0m  "
+        pretty = pretty "  " badge " \033[2m" sprintf("%-4s", v[i])
+        if (pmulti > 1) pretty = pretty " " h[i]
+        pretty = pretty "\033[0m " ((s[i] == "running") ? up : down)
+      }
+      printf "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n", pretty, h[i], t[i], v[i], n[i], s[i]
+    }
+  }'
+}
+
+# ---------- main -----------------------------------------------------------
+while :; do
+  gather
+
+  if ((list_only)); then
+    printf '%s\n' "$rows" | reorder | column -t -s$'\t'
+    exit 0
+  fi
+
+  pick=$(printf '%s\n' "$rows" \
+    | reorder \
+    | prettify \
+    | fzf --ansi --no-multi \
+          --delimiter=$'\x1f' --with-nth=1 --nth=1 \
+          --layout=reverse --info=inline \
+          --preview="'$0' __preview {2} {3} {4}" \
+          --preview-window='right,45%,border-left,<40(down,40%,border-top)' \
+          --prompt='pcthop> ') || exit 0
+
+  IFS=$'\x1f' read -r _ host type vmid name status <<<"$pick"
+  hop "$host"$'\t'"$type"$'\t'"$vmid"$'\t'"$name"$'\t'"$status"
+  ((loop)) || break
+done
