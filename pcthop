@@ -8,12 +8,12 @@
 # https://github.com/ijoshi129/pcthop
 set -euo pipefail
 
-VERSION="0.5.1"
+VERSION="0.5.2"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/pcthop/hosts"
 HIST_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/history"
 PROBE_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/probes"
 PROBE_TTL=60
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
+SSH_OPTS=(-n -o BatchMode=yes -o ConnectTimeout=5)
 
 usage() {
   cat <<'EOF'
@@ -149,7 +149,7 @@ command -v fzf >/dev/null || ((list_only)) || [[ -n "$REFRESH_STATE" ]] \
 # ---------- probes ----------------------------------------------------------
 probe_host() { # probe_host <host> <outfile> — writes up/down + refreshes cache
   local host=$1 out=$2 o res
-  if o=$(ssh -o BatchMode=yes -o ConnectTimeout=2 "$host" exit 2>&1); then res=up
+  if o=$(ssh -n -o BatchMode=yes -o ConnectTimeout=2 "$host" exit 2>&1); then res=up
   elif printf '%s' "$o" | grep -qiE 'permission denied|too many authentication|verification failed'; then res=up
   else res=down; fi
   printf '%s' "$res" > "$out"
@@ -279,13 +279,24 @@ prettify() {
 }
 
 # ---------- background refresher (has $FZF_PORT from main) ------------------
-publish() { # publish <state> [header] — push list + status header into fzf
-  local state=$1 hdr="${2:-}"
+dbg() { [[ -n "${PCTHOP_DEBUG:-}" ]] && printf '%s %s\n' "$(date +%T)" "$*" >> /tmp/pcthop-debug.log || true; }
+
+publish() { # publish <state> [header] — push list, then status header, into fzf
+  local state=$1 hdr="${2:-}" code=none hcode=skip rows_n
   build_rows "$state" | reorder | prettify > "$state/final.tmp" \
     && mv "$state/final.tmp" "$state/final"
-  [[ -n "${FZF_PORT:-}" ]] \
-    && curl -s -m 2 -X POST "localhost:$FZF_PORT" \
-         -d "reload(cat '$state/final')+change-header($hdr)" >/dev/null 2>&1 || true
+  rows_n=$(wc -l < "$state/final" 2>/dev/null | tr -d ' ')
+  if [[ -n "${FZF_PORT:-}" ]]; then
+    # reload always goes ALONE — never chain it with an action an older fzf
+    # might reject (a 400 would take the reload down with it; hit on 0.38)
+    code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' -X POST "localhost:$FZF_PORT" \
+             -d "reload(cat '$state/final')" 2>/dev/null) || code=curl_fail
+    if [[ -n "${PCTHOP_HEADER:-}" ]]; then
+      hcode=$(curl -s -m 2 -o /dev/null -w '%{http_code}' -X POST "localhost:$FZF_PORT" \
+                -d "change-header($hdr)" 2>/dev/null) || hcode=curl_fail
+    fi
+  fi
+  dbg "publish rows=$rows_n hdr='${hdr:+set}' port=${FZF_PORT:-none} reload=$code header=$hcode"
 }
 
 if [[ -n "$REFRESH_STATE" ]]; then
@@ -296,7 +307,9 @@ if [[ -n "$REFRESH_STATE" ]]; then
   fi
   all_pve() { local n; for n in ${nodes[@]+"${nodes[@]}"}; do [[ -f "$state/pve.$n.done" ]] || return 1; done; }
   all_probes() { local h; for h in ${ssh_hosts[@]+"${ssh_hosts[@]}"}; do [[ -s "$state/ssh.$h" ]] || return 1; done; }
+  dbg "refresh start state=$state port=${FZF_PORT:-none}"
   for ((t=0; t<100; t++)); do all_pve && break; sleep 0.1; done
+  dbg "pve wait done t=$t err=$(ls "$state"/pve.*.err 2>/dev/null | wc -l | tr -d ' ')"
   if ((want_ssh && probe)) && ! all_probes; then
     publish "$state" $'\033[2m⟳ probing hosts…\033[0m'
     for ((t=0; t<80; t++)); do all_probes && break; sleep 0.1; done
@@ -354,6 +367,13 @@ free_port() { # pick a localhost port fzf can listen on
   done
 }
 
+fzf_header_ok() { # change-header exists as a listen action on fzf >= 0.46
+  local v maj min
+  v=$(fzf --version 2>/dev/null | awk '{print $1}')
+  maj=${v%%.*}; min=${v#*.}; min=${min%%.*}
+  [[ "${maj:-0}" -gt 0 || "${min:-0}" -ge 46 ]]
+}
+
 fzf_run() { # reads prettified rows on stdin
   fzf --ansi --no-multi \
       --delimiter=$'\x1f' --with-nth=1 --nth=1 \
@@ -372,8 +392,13 @@ while :; do
       "$want_ct" "$want_vm" "$want_ssh" "$probe" > "$state/flags"
     launch_fetchers "$state"
     port=$(free_port)
-    FZF_EXTRA=(--listen "$port" --header $'\033[2m⟳ finding guests · probing hosts…\033[0m')
-    FZF_PORT=$port "$0" __refresh "$state" >/dev/null 2>&1 &
+    FZF_EXTRA=(--listen "$port")
+    PCTHOP_HEADER=""
+    if fzf_header_ok; then
+      PCTHOP_HEADER=1
+      FZF_EXTRA+=(--header $'\033[2m⟳ finding guests · probing hosts…\033[0m')
+    fi
+    PCTHOP_HEADER=$PCTHOP_HEADER FZF_PORT=$port "$0" __refresh "$state" >/dev/null 2>&1 &
     pick=$("$0" __initial "$state" | fzf_run) || { rm -rf "$state"; exit 0; }
     rm -rf "$state"
   else
