@@ -5,8 +5,9 @@ straight into it.
 
 ![pcthop picker](assets/pcthop.png)
 
-- **One list**: SSH hosts (with live ●/○ reachability) and Proxmox guests,
-  all discovered in parallel, so startup stays fast even with many hosts.
+- **Opens instantly**: the picker appears immediately; Proxmox guests and
+  live ●/○ host reachability stream in as answers arrive (a dim `·` means
+  the probe is still running). Recent probe results are cached for 60s.
 - **Frecency**: the entries you pick most float to the top (like `nextcloud`
   above), so your daily driver is usually just `pcthop` + enter.
 - Narrow terminal? The preview automatically drops below the list instead of
@@ -40,9 +41,10 @@ as you have.
 
 ## Install
 
-Needs [`fzf`](https://github.com/junegunn/fzf) **≥ 0.27** (for the adaptive
-preview layout) and SSH access (as root or a `pct`/`qm`-capable user) to your
-Proxmox node(s).
+Needs [`fzf`](https://github.com/junegunn/fzf) **≥ 0.27** (adaptive preview
+layout; **≥ 0.36** + `curl` for the instant-open streaming UI — older fzf
+falls back to loading everything first) and SSH access (as root or a
+`pct`/`qm`-capable user) to your Proxmox node(s).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ijoshi129/pcthop/main/pcthop \

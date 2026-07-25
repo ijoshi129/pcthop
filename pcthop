@@ -8,9 +8,11 @@
 # https://github.com/ijoshi129/pcthop
 set -euo pipefail
 
-VERSION="0.4.2"
+VERSION="0.5.0"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/pcthop/hosts"
 HIST_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/history"
+PROBE_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/probes"
+PROBE_TTL=60
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
 
 usage() {
@@ -46,13 +48,17 @@ KEYS (inside the picker)
 FILES
   ~/.cache/pcthop/history   pick history — most-used entries float to the
                             top of the list (delete the file to reset)
+  ~/.cache/pcthop/probes    recent host reachability (60s), shown instantly
 
 NOTES
+  * The picker opens immediately; guests and ●/○ reachability stream in as
+    hosts answer (a dim · means "probe still running"). Needs fzf >= 0.36 +
+    curl; older fzf falls back to waiting for everything first.
   * Containers open with `pct enter` — works with no sshd/network inside.
   * VMs open with `qm terminal` — needs a serial console on the VM
     (`qm set <vmid> -serial0 socket` + a getty inside). Exit with Ctrl+O.
   * A stopped guest prompts to start it first.
-  * SSH hosts open with plain `ssh <alias>`; ●/○ shows live reachability.
+  * SSH hosts open with plain `ssh <alias>`.
 
 REQUIRES  fzf, ssh (root or pct/qm-capable user on the node)
 EOF
@@ -78,6 +84,11 @@ if [[ "${1:-}" == "__preview" ]]; then
 fi
 
 # ---------- args -----------------------------------------------------------
+REFRESH_STATE="" REFRESH_MODE=""
+case "${1:-}" in
+  __refresh|__initial) REFRESH_MODE="$1"; REFRESH_STATE="${2:?}"; set -- ;;
+esac
+
 want_ct=1 want_vm=1 want_ssh=1 loop=0 list_only=0 probe=1 only_flags=0
 arg_hosts=()
 while (($#)); do
@@ -96,6 +107,7 @@ while (($#)); do
   shift
 done
 ((only_flags <= 1)) || die "-c, -m and -s are mutually exclusive"
+[[ -n "$REFRESH_STATE" && -r "$REFRESH_STATE/flags" ]] && . "$REFRESH_STATE/flags"
 
 # ---------- hosts ----------------------------------------------------------
 nodes=() ssh_hosts=()
@@ -131,72 +143,96 @@ fi
 ((${#nodes[@]} + ${#ssh_hosts[@]})) \
   || { usage >&2; echo >&2; die "nothing to list (args, env, or $CONFIG_FILE)"; }
 
-command -v fzf >/dev/null || ((list_only)) \
+command -v fzf >/dev/null || ((list_only)) || [[ -n "$REFRESH_STATE" ]] \
   || die "fzf not found — install it first (brew install fzf / apt install fzf)"
 
-# ---------- gather (all fetches + probes run in parallel) -------------------
+# ---------- probes ----------------------------------------------------------
+probe_host() { # probe_host <host> <outfile> — writes up/down + refreshes cache
+  local host=$1 out=$2 o res
+  if o=$(ssh -o BatchMode=yes -o ConnectTimeout=2 "$host" exit 2>&1); then res=up
+  elif printf '%s' "$o" | grep -qiE 'permission denied|too many authentication|verification failed'; then res=up
+  else res=down; fi
+  printf '%s' "$res" > "$out"
+  mkdir -p "$PROBE_CACHE"
+  printf '%s %s\n' "$res" "$(date +%s)" > "$PROBE_CACHE/$host"
+}
+
+cached_probe() { # cached_probe <host> — prints up/down if cache fresh, else fails
+  local f="$PROBE_CACHE/$1" res ts
+  [[ -r "$f" ]] || return 1
+  read -r res ts < "$f" 2>/dev/null || return 1
+  [[ -n "${ts:-}" ]] || return 1
+  (( $(date +%s) - ts <= PROBE_TTL )) || return 1
+  printf '%s' "$res"
+}
+
+# ---------- row building ----------------------------------------------------
 # Row format: host \t TYPE \t vmid \t name \t status
-#   SSH   <alias>          status up/down/-
+#   SSH   <alias>          status up/down/?/-
 #   CT/VM <vmid> <name>    status running/stopped/...
+guest_awk() { # guest_awk <host> < pve-output
+  awk -v host="$1" -v ct="$want_ct" -v vm="$want_vm" '
+    /^__QM__$/          { in_qm = 1; next }
+    /^ *VMID/           { next }                       # header lines
+    NF == 0             { next }
+    !in_qm && ct        { print host "\t" "CT" "\t" $1 "\t" $NF "\t" $2 }
+    in_qm  && vm        { print host "\t" "VM" "\t" $1 "\t" $2  "\t" $3 }
+  '
+}
+
+build_rows() { # build_rows <state> — raw rows from whatever has arrived so far
+  local state=$1 host st guest_rows=""
+  if ((want_ssh)); then
+    for host in ${ssh_hosts[@]+"${ssh_hosts[@]}"}; do
+      if [[ -s "$state/ssh.$host" ]]; then st=$(cat "$state/ssh.$host")
+      elif st=$(cached_probe "$host"); then :
+      else st='?'; fi
+      printf '%s\tSSH\t-\t%s\t%s\n' "$host" "$host" "$st"
+    done
+  fi
+  if ((want_ct || want_vm)); then
+    for host in ${nodes[@]+"${nodes[@]}"}; do
+      [[ -f "$state/pve.$host.done" && ! -f "$state/pve.$host.err" ]] || continue
+      guest_rows+=$(guest_awk "$host" <"$state/pve.$host")$'\n'
+    done
+    printf '%s' "$guest_rows" | sort -t$'\t' -k2,2 -k3,3n | grep -v '^$' || true
+  fi
+}
+
+launch_fetchers() { # launch_fetchers <state> — start probes + guest fetches
+  local state=$1 host
+  if ((want_ssh)); then
+    for host in ${ssh_hosts[@]+"${ssh_hosts[@]}"}; do
+      if ((probe)); then probe_host "$host" "$state/ssh.$host" 2>/dev/null &
+      else printf '%s' '-' > "$state/ssh.$host"; fi
+    done
+  fi
+  if ((want_ct || want_vm)); then
+    for host in ${nodes[@]+"${nodes[@]}"}; do
+      { { ssh "${SSH_OPTS[@]}" "$host" \
+            '(pct list 2>/dev/null; echo __QM__; qm list 2>/dev/null)' \
+            > "$state/pve.$host" || touch "$state/pve.$host.err"
+          touch "$state/pve.$host.done"; } 2>/dev/null; } &
+    done
+  fi
+}
+
+# Synchronous gather for -L and the old-fzf fallback.
 gather() {
-  rows=""
-  local host tmp
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/pcthop.XXXXXX")
-
-  if ((want_ssh && ${#ssh_hosts[@]})); then
-    for host in "${ssh_hosts[@]}"; do
-      if ((probe)); then
-        {
-          probe_out=$(ssh -o BatchMode=yes -o ConnectTimeout=2 "$host" exit 2>&1) \
-            && echo up > "$tmp/ssh.$host" \
-            || { printf '%s' "$probe_out" \
-                   | grep -qiE 'permission denied|too many authentication|verification failed' \
-                   && echo up > "$tmp/ssh.$host" || echo down > "$tmp/ssh.$host"; }
-        } &
-      else
-        echo '-' > "$tmp/ssh.$host"
-      fi
-    done
-  fi
-  if ((want_ct || want_vm)); then
-    for host in ${nodes[@]+"${nodes[@]}"}; do
-      ssh "${SSH_OPTS[@]}" "$host" \
-          '(pct list 2>/dev/null; echo __QM__; qm list 2>/dev/null)' \
-          > "$tmp/pve.$host" 2>/dev/null || touch "$tmp/pve.$host.err" &
-    done
-  fi
+  local state
+  state=$(mktemp -d "${TMPDIR:-/tmp}/pcthop.XXXXXX")
+  launch_fetchers "$state"
   wait
-
-  if ((want_ssh && ${#ssh_hosts[@]})); then
-    for host in "${ssh_hosts[@]}"; do
-      rows+="$host"$'\tSSH\t-\t'"$host"$'\t'"$(cat "$tmp/ssh.$host" 2>/dev/null || echo -)"$'\n'
-    done
-  fi
-
-  local guest_rows=""
-  if ((want_ct || want_vm)); then
-    for host in ${nodes[@]+"${nodes[@]}"}; do
-      [[ -e "$tmp/pve.$host.err" ]] \
-        && { printf 'pcthop: warning: cannot reach %s, skipping\n' "$host" >&2; continue; }
-      guest_rows+=$(awk -v host="$host" -v ct="$want_ct" -v vm="$want_vm" '
-        /^__QM__$/          { in_qm = 1; next }
-        /^ *VMID/           { next }                       # header lines
-        NF == 0             { next }
-        !in_qm && ct        { print host "\t" "CT" "\t" $1 "\t" $NF "\t" $2 }
-        in_qm  && vm        { print host "\t" "VM" "\t" $1 "\t" $2  "\t" $3 }
-      ' <"$tmp/pve.$host")$'\n'
-    done
-    rows+=$(printf '%s' "$guest_rows" | sort -t$'\t' -k2,2 -k3,3n)$'\n'
-  fi
-
-  rm -rf "$tmp"
-  rows=$(printf '%s' "$rows" | grep -v '^$' || true)
+  for host in ${nodes[@]+"${nodes[@]}"}; do
+    [[ -e "$state/pve.$host.err" ]] \
+      && printf 'pcthop: warning: cannot reach %s, skipping\n' "$host" >&2
+  done
+  rows=$(build_rows "$state")
+  rm -rf "$state"
   [[ -n "$rows" ]] || die "nothing found on: ${nodes[*]-} ${ssh_hosts[*]-}"
 }
 
 # ---------- frecency --------------------------------------------------------
-# Most-picked entries (from HIST_FILE, key TYPE/host/name) float to the top;
-# ties keep the gather order.
 reorder() {
   [[ -s "$HIST_FILE" ]] || { cat; return; }
   awk -F'\t' -v histfile="$HIST_FILE" '
@@ -213,9 +249,63 @@ record_pick() { # record_pick TYPE host name
   fi
 }
 
+# ---------- display --------------------------------------------------------
+prettify() {
+  awk -F'\t' '
+  { h[NR]=$1; t[NR]=$2; v[NR]=$3; n[NR]=$4; s[NR]=$5
+    if (length($4) > w) w = length($4)
+    if (t[NR] != "SSH") pnodes[$1] = 1 }
+  END {
+    pmulti = 0; for (x in pnodes) pmulti++
+    for (i = 1; i <= NR; i++) {
+      up   = "\033[32m●\033[0m"
+      down = "\033[31m○\033[0m"
+      wait = "\033[2m·\033[0m"
+      pretty = sprintf("%-" w "s", n[i])
+      if (t[i] == "SSH") {
+        pretty = pretty "  \033[36mhost\033[0m "
+        if (s[i] == "up") pretty = pretty " " up
+        else if (s[i] == "down") pretty = pretty " " down
+        else if (s[i] == "?") pretty = pretty " " wait
+      } else {
+        badge = (t[i] == "CT") ? "\033[33mlxc\033[0m " : "\033[35mvm\033[0m  "
+        pretty = pretty "  " badge " \033[2m" sprintf("%-4s", v[i])
+        if (pmulti > 1) pretty = pretty " " h[i]
+        pretty = pretty "\033[0m " ((s[i] == "running") ? up : down)
+      }
+      printf "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n", pretty, h[i], t[i], v[i], n[i], s[i]
+    }
+  }'
+}
+
+# ---------- background refresher (spawned by fzf; has $FZF_PORT) ------------
+publish() { # publish <state> — rebuild the list and push it into fzf
+  local state=$1
+  build_rows "$state" | reorder | prettify > "$state/final.tmp" \
+    && mv "$state/final.tmp" "$state/final"
+  [[ -n "${FZF_PORT:-}" ]] \
+    && curl -s -m 2 -X POST "localhost:$FZF_PORT" \
+         -d "reload(cat '$state/final')" >/dev/null 2>&1 || true
+}
+
+if [[ -n "$REFRESH_STATE" ]]; then
+  state=$REFRESH_STATE
+  if [[ "$REFRESH_MODE" == "__initial" ]]; then
+    build_rows "$state" | reorder | prettify
+    exit 0
+  fi
+  all_pve() { local n; for n in ${nodes[@]+"${nodes[@]}"}; do [[ -f "$state/pve.$n.done" ]] || return 1; done; }
+  all_probes() { local h; for h in ${ssh_hosts[@]+"${ssh_hosts[@]}"}; do [[ -s "$state/ssh.$h" ]] || return 1; done; }
+  for ((t=0; t<100; t++)); do all_pve && break; sleep 0.1; done
+  publish "$state"
+  if ((want_ssh && probe)); then
+    for ((t=0; t<80; t++)); do all_probes && break; sleep 0.1; done
+    publish "$state"
+  fi
+  exit 0
+fi
+
 # ---------- hop ------------------------------------------------------------
-# In loop mode run the session in the foreground and come back; otherwise
-# exec (replace pcthop with the session).
 run() { if ((loop)); then "$@" || true; else exec "$@"; fi; }
 
 hop() {
@@ -241,53 +331,57 @@ hop() {
   fi
 }
 
-# ---------- display --------------------------------------------------------
-# Pretty, narrow-friendly lines: "name  badge [vmid node] glyph". The raw
-# fields ride along behind a \x1f delimiter; fzf shows/matches field 1 only.
-prettify() {
-  awk -F'\t' '
-  { h[NR]=$1; t[NR]=$2; v[NR]=$3; n[NR]=$4; s[NR]=$5
-    if (length($4) > w) w = length($4)
-    if (t[NR] != "SSH") pnodes[$1] = 1 }
-  END {
-    pmulti = 0; for (x in pnodes) pmulti++
-    for (i = 1; i <= NR; i++) {
-      up   = "\033[32m●\033[0m"
-      down = "\033[31m○\033[0m"
-      pretty = sprintf("%-" w "s", n[i])
-      if (t[i] == "SSH") {
-        pretty = pretty "  \033[36mhost\033[0m "
-        if (s[i] == "up") pretty = pretty " " up
-        else if (s[i] == "down") pretty = pretty " " down
-      } else {
-        badge = (t[i] == "CT") ? "\033[33mlxc\033[0m " : "\033[35mvm\033[0m  "
-        pretty = pretty "  " badge " \033[2m" sprintf("%-4s", v[i])
-        if (pmulti > 1) pretty = pretty " " h[i]
-        pretty = pretty "\033[0m " ((s[i] == "running") ? up : down)
-      }
-      printf "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n", pretty, h[i], t[i], v[i], n[i], s[i]
-    }
-  }'
+# ---------- main -----------------------------------------------------------
+if ((list_only)); then
+  gather
+  printf '%s\n' "$rows" | reorder | column -t -s$'\t'
+  exit 0
+fi
+
+fzf_async() { # fzf >= 0.36 (--listen=PORT + reload via POST) and curl available
+  command -v curl >/dev/null || return 1
+  local v maj min
+  v=$(fzf --version 2>/dev/null | awk '{print $1}')
+  maj=${v%%.*}; min=${v#*.}; min=${min%%.*}
+  [[ "${maj:-0}" -gt 0 || "${min:-0}" -ge 36 ]]
 }
 
-# ---------- main -----------------------------------------------------------
+free_port() { # pick a localhost port fzf can listen on
+  local p
+  while :; do
+    p=$((RANDOM % 20000 + 20000))
+    (echo >/dev/tcp/127.0.0.1/$p) 2>/dev/null || { printf '%s' "$p"; return; }
+  done
+}
+
+fzf_run() { # reads prettified rows on stdin
+  fzf --ansi --no-multi \
+      --delimiter=$'\x1f' --with-nth=1 --nth=1 \
+      --layout=reverse --info=inline \
+      ${FZF_EXTRA[@]+"${FZF_EXTRA[@]}"} \
+      --preview="'$0' __preview {2} {3} {4}" \
+      --preview-window='right,45%,border-left,<40(down,40%,border-top)' \
+      --prompt='pcthop> '
+}
+
+trap 'rm -rf "${state:-}"' EXIT
 while :; do
-  gather
-
-  if ((list_only)); then
-    printf '%s\n' "$rows" | reorder | column -t -s$'\t'
-    exit 0
+  if fzf_async; then
+    state=$(mktemp -d "${TMPDIR:-/tmp}/pcthop.XXXXXX")
+    printf 'want_ct=%s want_vm=%s want_ssh=%s probe=%s\n' \
+      "$want_ct" "$want_vm" "$want_ssh" "$probe" > "$state/flags"
+    launch_fetchers "$state"
+    port=$(free_port)
+    FZF_EXTRA=(--listen "$port")
+    FZF_PORT=$port "$0" __refresh "$state" >/dev/null 2>&1 &
+    pick=$("$0" __initial "$state" | fzf_run) || { rm -rf "$state"; exit 0; }
+    rm -rf "$state"
+  else
+    gather
+    FZF_EXTRA=()
+    pick=$(printf '%s\n' "$rows" | reorder | prettify | fzf_run) || exit 0
   fi
-
-  pick=$(printf '%s\n' "$rows" \
-    | reorder \
-    | prettify \
-    | fzf --ansi --no-multi \
-          --delimiter=$'\x1f' --with-nth=1 --nth=1 \
-          --layout=reverse --info=inline \
-          --preview="'$0' __preview {2} {3} {4}" \
-          --preview-window='right,45%,border-left,<40(down,40%,border-top)' \
-          --prompt='pcthop> ') || exit 0
+  [[ -n "${pick:-}" ]] || exit 0
 
   IFS=$'\x1f' read -r _ host type vmid name status <<<"$pick"
   hop "$host"$'\t'"$type"$'\t'"$vmid"$'\t'"$name"$'\t'"$status"
