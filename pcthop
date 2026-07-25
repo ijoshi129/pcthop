@@ -8,7 +8,7 @@
 # https://github.com/ijoshi129/pcthop
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/pcthop/hosts"
 HIST_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/history"
 PROBE_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/probes"
@@ -278,14 +278,14 @@ prettify() {
   }'
 }
 
-# ---------- background refresher (spawned by fzf; has $FZF_PORT) ------------
-publish() { # publish <state> — rebuild the list and push it into fzf
-  local state=$1
+# ---------- background refresher (has $FZF_PORT from main) ------------------
+publish() { # publish <state> [header] — push list + status header into fzf
+  local state=$1 hdr="${2:-}"
   build_rows "$state" | reorder | prettify > "$state/final.tmp" \
     && mv "$state/final.tmp" "$state/final"
   [[ -n "${FZF_PORT:-}" ]] \
     && curl -s -m 2 -X POST "localhost:$FZF_PORT" \
-         -d "reload(cat '$state/final')" >/dev/null 2>&1 || true
+         -d "reload(cat '$state/final')+change-header($hdr)" >/dev/null 2>&1 || true
 }
 
 if [[ -n "$REFRESH_STATE" ]]; then
@@ -297,11 +297,11 @@ if [[ -n "$REFRESH_STATE" ]]; then
   all_pve() { local n; for n in ${nodes[@]+"${nodes[@]}"}; do [[ -f "$state/pve.$n.done" ]] || return 1; done; }
   all_probes() { local h; for h in ${ssh_hosts[@]+"${ssh_hosts[@]}"}; do [[ -s "$state/ssh.$h" ]] || return 1; done; }
   for ((t=0; t<100; t++)); do all_pve && break; sleep 0.1; done
-  publish "$state"
-  if ((want_ssh && probe)); then
+  if ((want_ssh && probe)) && ! all_probes; then
+    publish "$state" $'\033[2m⟳ probing hosts…\033[0m'
     for ((t=0; t<80; t++)); do all_probes && break; sleep 0.1; done
-    publish "$state"
   fi
+  publish "$state"
   exit 0
 fi
 
@@ -372,7 +372,7 @@ while :; do
       "$want_ct" "$want_vm" "$want_ssh" "$probe" > "$state/flags"
     launch_fetchers "$state"
     port=$(free_port)
-    FZF_EXTRA=(--listen "$port")
+    FZF_EXTRA=(--listen "$port" --header $'\033[2m⟳ finding guests · probing hosts…\033[0m')
     FZF_PORT=$port "$0" __refresh "$state" >/dev/null 2>&1 &
     pick=$("$0" __initial "$state" | fzf_run) || { rm -rf "$state"; exit 0; }
     rm -rf "$state"
