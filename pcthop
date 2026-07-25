@@ -8,7 +8,7 @@
 # https://github.com/ijoshi129/pcthop
 set -euo pipefail
 
-VERSION="0.5.2"
+VERSION="0.5.3"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/pcthop/hosts"
 HIST_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/history"
 PROBE_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/pcthop/probes"
@@ -295,6 +295,14 @@ publish() { # publish <state> [header] — push list, then status header, into f
       hcode=$(curl -s -m 2 -o /dev/null -w '%{http_code}' -X POST "localhost:$FZF_PORT" \
                 -d "change-header($hdr)" 2>/dev/null) || hcode=curl_fail
     fi
+    # prompt doubles as a loading indicator — change-prompt parses even on 0.38
+    if [[ -n "$hdr" ]]; then
+      curl -s -m 2 -o /dev/null -X POST "localhost:$FZF_PORT" \
+        -d 'change-prompt(pcthop ⟳> )' 2>/dev/null || true
+    else
+      curl -s -m 2 -o /dev/null -X POST "localhost:$FZF_PORT" \
+        -d 'change-prompt(pcthop> )' 2>/dev/null || true
+    fi
   fi
   dbg "publish rows=$rows_n hdr='${hdr:+set}' port=${FZF_PORT:-none} reload=$code header=$hcode"
 }
@@ -374,14 +382,14 @@ fzf_header_ok() { # change-header exists as a listen action on fzf >= 0.46
   [[ "${maj:-0}" -gt 0 || "${min:-0}" -ge 46 ]]
 }
 
-fzf_run() { # reads prettified rows on stdin
+fzf_run() { # reads prettified rows on stdin; FZF_EXTRA last so it can override
   fzf --ansi --no-multi \
       --delimiter=$'\x1f' --with-nth=1 --nth=1 \
       --layout=reverse --info=inline \
-      ${FZF_EXTRA[@]+"${FZF_EXTRA[@]}"} \
       --preview="'$0' __preview {2} {3} {4}" \
       --preview-window='right,45%,border-left,<40(down,40%,border-top)' \
-      --prompt='pcthop> '
+      --prompt='pcthop> ' \
+      ${FZF_EXTRA[@]+"${FZF_EXTRA[@]}"}
 }
 
 trap 'rm -rf "${state:-}"' EXIT
@@ -392,7 +400,7 @@ while :; do
       "$want_ct" "$want_vm" "$want_ssh" "$probe" > "$state/flags"
     launch_fetchers "$state"
     port=$(free_port)
-    FZF_EXTRA=(--listen "$port")
+    FZF_EXTRA=(--listen "$port" --prompt 'pcthop ⟳> ')
     PCTHOP_HEADER=""
     if fzf_header_ok; then
       PCTHOP_HEADER=1
